@@ -1,0 +1,237 @@
+---
+title: "liv_data"
+format: 
+  html:
+    self-contained: true
+params:
+  hide_answer: true
+---
+
+## Exploratory analysis of Liv's data
+
+This report contains R code and output intermingled using Quarto, 
+based on the Literate Programming paradigm of Knuth.
+
+The input to this code is a simplified version of Liv's .xlsx spreadsheets 
+with extraneous material removed to make them easier to parse.
+
+Load the necessary libraries and calculate the approximate density of each cushion.
+Note that this is a guess as there is VF and HR in each cushion, 
+but only one weight of the combined cushion.
+
+```{r}
+#| echo: true
+# Load required libraries.
+library(dplyr)
+library(TOSTER)
+library(ggplot2)
+
+```
+
+Read the recorded measurements and mass and calculate the density.
+The `density_spec` table is from the Dunlop specification sheets.
+
+```{r}
+#| echo: true
+# Deal with density data separately as very different structure
+# and needs several calculations to get the (approximate) density.
+
+liv_density <- readxl::read_xlsx(here::here("data", "density.xlsx"),
+                                 range = readxl::cell_cols("A:K"))
+# Specification from Dunlop, in kg/m3
+density_spec <- tibble::tribble(
+  ~foam, ~min, ~max,
+  "VF",       58.0, 62.0,
+  "EN40-230", 39.0, 42.0,
+  "EN50-250", 49.0, 53.5
+)
+
+# Calculate various volumes in mm3
+liv_density <- liv_density %>%
+  mutate(t_mean = rowMeans(across(starts_with("T"))),
+         vf_vol = length * width * vf_thickness,
+         sag_vol = (sag_height * sag_width * length), # cutout for seat sag
+         hr_vol = length * width * t_mean - vf_vol - sag_vol
+        ) %>%
+# The mass of VF is unknown, but can be estimated from the density_spec
+  mutate(
+    vf_min_mass = (vf_vol / 1E9) * filter(density_spec, foam == "VF")$max * 1000,
+    vf_max_mass = (vf_vol / 1E9) * filter(density_spec, foam == "VF")$min * 1000,
+    hr_max_mass = mass - vf_min_mass, # grams
+    hr_min_mass = mass - vf_max_mass,
+    hr_min = 1E6 * hr_min_mass / hr_vol,  # Convert back to kg/m3
+    hr_max = 1E6 * hr_max_mass / hr_vol
+  )
+
+```
+
+Now load the test results, rearrange them for easier autmated processing and
+calculate some summary staistices.
+
+```{r}
+# Read the testing results
+data_file <- here::here("data", "results.xlsx")
+
+# Display sheet names
+sheet_names <- readxl::excel_sheets(data_file)
+print(sheet_names)
+
+# Read the two sheets constructed from Liv's data & name them
+# Convert to long form for easier analysis,
+# then combine both data sets by row and
+# group by foam type, variable and the load level for each result
+liv_data <- sheet_names %>%                  # Take the named sheets
+  purrr::set_names() %>%                     # make them a named list
+  purrr::map(                                # apply a function to each element
+    function(x) {
+      readxl::read_excel(data_file, x) %>%   # read the named sheet
+      tidyr::pivot_longer(cols = where(is.numeric), # use the results columns
+                   names_to = "level",       # column names to 'level'
+                   values_to = "value"       # each value to 'value'
+                  )
+    }
+  ) %>%
+  bind_rows(.id = "var") %>%      # combine by rows, put original names in 'var'
+  group_by(foam, var, level)      # make groups for each independent measurement
+
+# liv_data is now a list with columns named
+# var = lcdod or hysteresis
+# cushion = cushion ID number
+# foam = EN40-230 or EN50-250
+# level = load level for measurement
+# value = measurement
+
+# Define a function to calculate the span of the given percentile
+# percentile defaults to 95% (0.95)
+CI = function(sd, percentile = 0.95) {
+  interval = (percentile + 1)/2
+  qnorm(p = interval, mean = 0, sd = sd)
+}
+
+# Show the Summary stats for each variable,including the 95% CI
+liv_summary <- liv_data %>%
+  summarise(avg = mean(value), sd = sd(value), n = n()) %>%
+  mutate(delta = CI(sd, 0.95), lo_95 = avg - delta, hi_95 = avg + delta) %>%
+  select(-delta) %>%
+  arrange(var, level, foam)
+
+print(liv_summary)
+```
+
+```{r}
+# Make some simple box plots to show the spread of the data
+plots <- list()
+for (var_name in unique(liv_data$var)) {
+  plots[[var_name]] <- liv_data %>%
+    filter(var == var_name) %>%
+    ggplot() +
+    aes(y = value, x = foam, colour = foam) +
+    geom_boxplot() +
+    geom_jitter(colour = "black", width = 0.25) +
+    labs(title = var_name, y = var_name) +
+    facet_wrap(~level)
+}
+print(plots)
+```
+
+## TOST or equivalence testing
+
+Run a **T**wo **O**ne **S**ided **T**est on each comparison group 
+(i.e. compare foams for each measured variable and level)
+
+
+```{r}
+# Want to compare foams for each variable and level.
+# Regroup the data with the required groups them map a function to each group
+result_list <- liv_data %>% 
+  ungroup() %>% # remove the old groups first
+  group_by(var, level) %>% # then regroup
+  group_map( 
+    function(data = .x, group = foam, values = value) {
+      # t_TOST compares two vectors, create those from 
+      # the groups defined by the `group` column
+      #df <- select(data, !!group, !!values)
+      bits <- split(data, ~ {{group}}) # this sprays Warnings
+      # then extract the values to compare from the `values` column
+      x <- pull(bits[[1]], {{values}});
+      y <- pull(bits[[2]], {{values}});
+      # Set the size of the equivalence bounds at 10% of the combined mean 
+      mean_all = mean(c(x, y)) / 10;
+      # Then do a TOST using that bound size (half above and half below).
+      TOSTER::t_TOST(x, y, eqb = mean_all / 2) 
+    }
+  ) 
+```
+
+
+```{r}
+# Lots of fuss to get the group names back to name the result list
+keys <- liv_data %>% 
+    ungroup() %>% # remove the old groups first
+    group_by(var, level) %>% group_keys()
+result_names <- paste(keys$var, keys$level)
+
+names(result_list) <- result_names
+```
+
+
+```{r}
+# Turn output back on
+#| output: asis
+print(result_list)
+```
+
+
+`r if (params$hide_answer) "::: {.content-hidden}"`
+
+## Possible Outlier or Anomalous Result
+
+The hysteresis data look odd, and it looks like one point is an outlier.
+Check which one by adding point labels to the plot
+
+```{r}
+# Add labels to the existing plot and redraw
+plots[["hysteresis"]] %+% 
+  geom_label(aes(label = cushion), 
+             hjust = "left", alpha = 0.5, position = "dodge")
+
+```
+
+
+
+```{r}
+# Notice an issue with one result - check if the density or mass is related
+density_plot <- liv_data %>%
+  filter(var == "hysteresis", foam == "EN40-230") |>
+  left_join(liv_density, by = "cushion") |>
+  ggplot() +
+  aes(x=hr_max, y = value, colour = level, label = cushion) +
+  geom_point() +
+  geom_label(hjust = "left", alpha = 0.5, position = "dodge") +
+  labs(title = "hysteresis vs density", 
+         y = "hysteresis", 
+         x = "max HR density")
+
+print(density_plot)
+
+```
+
+Comparing the two plots it looks like `W855791-02` is anomalous.
+Looking at the density & weight data, this cushion is much lighter than 
+any other cushion (about 65 to 90 grams lighter).
+
+```{r}
+liv_density %>% 
+  select(cushion, foam, mass, hr_min, hr_max) %>%
+  print()
+
+liv_density %>% 
+  ggplot() + aes(y = cushion, x = mass, colour = foam) + geom_point()
+```
+
+There may be a problem with this cushion, and it should be checked.
+
+If the density data *are* correct then the anomalous result is possibly due
+to the different density of this cushion.
+
+`r if (params$hide_answer) ":::"`
