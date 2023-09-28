@@ -182,9 +182,10 @@ Whys does `lcdod` appear to have a trend over time?
 ```{r}
 
 will_data %>% 
-  filter(var == "lcdod") %>%
+  filter(var == "lcdod") %>% 
+    tidyr::unite(test_ID, cushion, rep, sep = ".") %>%
   ggplot() +
-    aes(y = value, x = as.factor(cushion)) +
+    aes(y = value, x = test_ID) +
     geom_jitter(colour = "black", width = 0.25) +
     geom_smooth() +
     labs(title = var_name, y = var_name) +
