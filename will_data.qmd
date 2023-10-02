@@ -235,6 +235,29 @@ if (params$show_complete_TOST) {
 ```
 
 
+Calculate the number needed to determine a significant TOST for each group
+```{r}
+eqb <- result_list %>% purrr::map_vec( \(x) x$eqb$high_eq[[1]])
+data_for_power <- cbind(data_summary, eqb = rep(eqb, each = 2))
+
+n_TOST <- function(sd, eqb) {
+  TOST <- power_t_TOST(sd = sd, eqb = eqb, alpha = 0.05, power = 0.80)
+  TOST$n
+}
+n_ttest <- function(sd, eqb) {
+  ttest <- power.t.test(sd = sd, delta = 2 * eqb, sig.level = 0.05, power = 0.80)
+  ttest$n
+}
+
+data_for_power %>% 
+  mutate(n_TOST = purrr::pmap(list(sd, eqb), n_TOST),
+         n_ttest = purrr::pmap(list(sd, eqb), n_ttest)
+         ) %>%
+  tidyr::unnest(cols = c(n_TOST, n_ttest))
+
+```
+
+
 `r if (params$hide_answer) "::: {.content-hidden}"`
 
 ## Possible Issues
